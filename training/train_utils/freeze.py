@@ -11,7 +11,7 @@ from typing import List
 import torch.nn as nn
 
 # ------------------------------------------------------------
-# Glob‑matching flags (behave like the Unix shell) 🐚
+# Glob‑matching flags (behave like the Unix shell) 
 # ------------------------------------------------------------
 GLOB_FLAGS = (
     fnmatch.CASE       # case‑sensitive

@@ -3,10 +3,13 @@ defaults:
 
 exp_name: exp001
 img_size: 518
-num_workers: 8
+num_workers: 0
 seed_value: 42
-accum_steps: 1
+accum_steps: 3
 patch_size: 14
+
+limit_train_batches: 800
+limit_val_batches: 400
 
 data:
   # The code for data still looks too complicated. I should refactor this again (do I have time?...)
@@ -16,50 +19,92 @@ data:
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
+      debug: True
+      repeat_batch: True
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: train
-          CO3D_DIR: /checkpoint/repligen/shared/datasets/co3d/
-          CO3D_ANNOTATION_DIR: /checkpoint/repligen/jianyuan/datasets/co3d_anno
+          # CO3D_DIR: /checkpoint/repligen/shared/datasets/co3d/
+          # CO3D_ANNOTATION_DIR: /checkpoint/repligen/jianyuan/datasets/co3d_anno
+          CO3D_DIR: /fsx-repligen/jianyuan/transfer_buffer/small_set/co3d/
+          CO3D_ANNOTATION_DIR: /fsx-repligen/jianyuan/transfer_buffer/small_set/co3d_anno
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
     common_config:
       img_size: ${img_size}
       patch_size: ${patch_size}
+      debug: True
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: test
-          CO3D_DIR: /checkpoint/repligen/shared/datasets/co3d/
-          CO3D_ANNOTATION_DIR: /checkpoint/repligen/jianyuan/datasets/co3d_anno
+          # CO3D_DIR: /checkpoint/repligen/shared/datasets/co3d/
+          # CO3D_ANNOTATION_DIR: /checkpoint/repligen/jianyuan/datasets/co3d_anno
+          CO3D_DIR: /fsx-repligen/jianyuan/transfer_buffer/small_set/co3d/
+          CO3D_ANNOTATION_DIR: /fsx-repligen/jianyuan/transfer_buffer/small_set/co3d_anno
 
 
 logging:
   log_dir: logs
+  log_visuals: False
+  log_freq: 1
   log_level_primary: DEBUG
   log_level_secondary: WARNING
   all_ranks: False
   tensorboard_writer:
     _target_: train_utils.tb_writer.TensorBoardLogger
     path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - loss_conf_depth
+        - loss_reg_depth
+        - loss_grad_depth
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - loss_conf_depth
+        - loss_reg_depth
+        - loss_grad_depth
+
 
 
 checkpoint:
   save_dir: logs/${exp_name}
   save_freq: 10
-  resume_checkpoint_path: /home/jianyuan/data/model.pt
+  resume_checkpoint_path: /fsx-repligen/jianyuan/transfer_buffer/ckpts/model.pt
+  strict: False
 
 
 loss:
   _target_: loss.MultitaskLoss
-  camera: null  # template, going to clean the dirty code and implement it later
-  depth: null   # template, going to clean the dirty code and implement it later
-  point: null   # template, going to clean the dirty code and implement it later
-  track: null   # template, going to clean the dirty code and implement it later
+  camera: 
+    weight: 5.0
+    loss_type: "l1" # The paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.  
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad" 
+    valid_range: 0.98
+  point: null
+  # If you want to enable point, use the following config
+  # point: 
+  #   weight: 1.0
+  #   gradient_loss_fn: "normal" 
+  #   valid_range: 0.98
+  track: null   
 
 
 

@@ -96,11 +96,15 @@ class Co3dDataset(BaseDataset):
         self.get_nearby = common_conf.get_nearby
         self.load_depth = common_conf.load_depth
         self.inside_random = common_conf.inside_random
+        self.allow_duplicate_img = common_conf.allow_duplicate_img
 
         if CO3D_DIR is None or CO3D_ANNOTATION_DIR is None:
             raise ValueError("Both CO3D_DIR and CO3D_ANNOTATION_DIR must be specified.")
 
         category = sorted(SEEN_CATEGORIES)
+
+        if self.debug:
+            category = ["apple"]
 
         if split == "train":
             split_name_list = ["train"]
@@ -178,7 +182,7 @@ class Co3dDataset(BaseDataset):
         """
         if self.inside_random:
             seq_index = random.randint(0, self.sequence_list_len - 1)
-
+            
         if seq_name is None:
             seq_name = self.sequence_list[seq_index]
 
@@ -186,7 +190,7 @@ class Co3dDataset(BaseDataset):
 
         if ids is None:
             ids = np.random.choice(
-                len(metadata), img_per_seq, replace=self.duplicate_img
+                len(metadata), img_per_seq, replace=self.allow_duplicate_img
             )
 
         annos = [metadata[i] for i in ids]
@@ -213,12 +217,11 @@ class Co3dDataset(BaseDataset):
                 depth_path = image_path.replace("/images", "/depths") + ".geometric.png"
                 depth_map = read_depth(depth_path, 1.0)
 
-                if self.mask_depth:
-                    mvs_mask_path = image_path.replace(
-                        "/images", "/depth_masks"
-                    ).replace(".jpg", ".png")
-                    mvs_mask = cv2.imread(mvs_mask_path, cv2.IMREAD_GRAYSCALE) > 128
-                    depth_map[~mvs_mask] = 0
+                mvs_mask_path = image_path.replace(
+                    "/images", "/depth_masks"
+                ).replace(".jpg", ".png")
+                mvs_mask = cv2.imread(mvs_mask_path, cv2.IMREAD_GRAYSCALE) > 128
+                depth_map[~mvs_mask] = 0
 
                 depth_map = threshold_depth_map(
                     depth_map, min_percentile=-1, max_percentile=98

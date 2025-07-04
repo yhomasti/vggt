@@ -21,6 +21,7 @@ except AttributeError:
 from vggt.utils.geometry import closed_form_inverse_se3
 
 
+
 #####################################################################################################################
 def crop_image_depth_and_intrinsic_by_pp(
     image, depth_map, intrinsic, target_shape, track=None, filepath=None, strict=False

@@ -79,7 +79,6 @@ class DynamicTorchDataset(ABC):
             self.dataset,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            drop_last=self.drop_last,
             batch_sampler=self.batch_sampler,
             collate_fn=self.collate_fn,
             persistent_workers=self.persistent_workers,
@@ -90,6 +89,7 @@ class DynamicTorchDataset(ABC):
                 worker_init_fn=self.worker_init_fn,
             ),
         )
+        
 
 class DynamicBatchSampler(Sampler):
     """

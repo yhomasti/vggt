@@ -6,13 +6,13 @@
 
 '''
 # Plan: This file should provide a trainer class, which provides
-# 1. The init of DDP
-# 2. The init of optimizers, tb, timers, and so on
+# 1. The init of DDP                                            Done
+# 2. The init of optimizers, tb, timers, and so on               Done
 # 3. A basic training framework (especially for finetuning)
-#       self._train_epoch_
-#       self._process_batch_
-#       self._step_
-# ETA: hope I can finish this before June 8th
+#       self._train_epoch_                                     Done
+#       self._process_batch_                                  Done
+#       self._step_                                           Done
+# 4. The training loop: more utils to be added
 '''
 import contextlib
 
@@ -40,6 +40,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torchvision
+
+
 import fvcore
 from einops import rearrange
 from hydra.utils import instantiate
@@ -53,7 +55,9 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.distributed import get_machine_local_and_dist_rank
 from train_utils.freeze import freeze_modules
-from train_utils.optimizer import build_optimizer
+from train_utils.optimizer import construct_optimizers
+from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
+
 class Trainer:
     """
     Trainer supporting the DDP training strategies.
@@ -92,7 +96,6 @@ class Trainer:
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
 
-
         # hyperparameters
         self.accum_steps = accum_steps
         self.max_epochs = max_epochs
@@ -123,6 +126,8 @@ class Trainer:
             is_dist_avail_and_initialized()
         ), "Torch distributed needs to be initialized before calling the trainer."
 
+
+
         self._setup_components()  # Except Optimizer everything is setup here.
         self._setup_dataloaders()
 
@@ -133,22 +138,22 @@ class Trainer:
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
 
         if self.mode != "val":
-            self.optims = build_optimizer(
+            self.optims = construct_optimizers(
                 self.model,
                 self.optim_conf,
             )
 
+
         ################################
-        for _ in range(10):
-            print(f"Custom resume ckpt: {self.resume_checkpoint_path}")
+        # If you want to force to resume from a specific checkpoint, you can do so by setting the resume_checkpoint_path in the config
         if self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        ################################
-
-        import pdb;pdb.set_trace()
-        self.load_checkpoint()
+        else:   
+            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+            if ckpt_path is not None:
+                self._load_resuming_checkpoint(ckpt_path)
+                
         self._setup_ddp_distributed_training(distributed, device)
-
         dist.barrier()
 
     def _setup_timers(self):
@@ -158,18 +163,6 @@ class Trainer:
         self.start_time = time.time()
         self.ckpt_time_elapsed = 0
 
-
-    def _get_meters(self, phase_filters=None):
-        if self.meters is None:
-            return {}
-        meters = {}
-        for phase, phase_meters in self.meters.items():
-            if phase_filters is not None and phase not in phase_filters:
-                continue
-            for key, key_meters in phase_meters.items():
-                for name, meter in key_meters.items():
-                    meters[f"{phase}_{key}/{name}"] = meter
-        return meters
 
 
     def _setup_env_variables(self, env_variables_conf) -> None:
@@ -189,6 +182,43 @@ class Trainer:
                 timeout=timedelta(minutes=distributed_conf.timeout_mins))
 
         self.rank = dist.get_rank()
+
+
+
+    def _load_resuming_checkpoint(self, ckpt_path: str):
+        logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
+
+        with g_pathmgr.open(ckpt_path, "rb") as f:
+            checkpoint = torch.load(f, map_location="cpu")
+            
+        model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        missing_keys, unexpected_keys = self.model.load_state_dict(model_state_dict, strict=self.checkpoint_conf.strict)
+        
+        if self.rank == 0:
+            if missing_keys:
+                logging.warning(f"Missing keys when loading model state dict: {missing_keys}")
+            else:
+                logging.info(f"No missing keys when loading model state dict")
+                
+            if unexpected_keys:
+                logging.warning(f"Unexpected keys when loading model state dict: {unexpected_keys}")
+            else:
+                logging.info(f"No unexpected keys when loading model state dict")
+            
+        logging.info(f"Loading the optimizer state dict (rank {self.rank})")
+        if "optimizer" in checkpoint:
+            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+
+        if "epoch" in checkpoint:
+            self.epoch = checkpoint["epoch"]
+
+        self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
+        self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+
+        if self.optim_conf.amp.enabled and "scaler" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler"])
+
+
 
 
     def _setup_device(self, device):
@@ -256,7 +286,6 @@ class Trainer:
 
 
     def _setup_ddp_distributed_training(self, distributed_conf, device):
-        # Simplified to only handle standard nn.Module with DDP
         assert isinstance(self.model, torch.nn.Module)
 
         ddp_options = dict(
@@ -272,15 +301,534 @@ class Trainer:
             **ddp_options,
         )
 
-        if distributed_conf.comms_dtype is not None:  # noqa
-            from torch.distributed.algorithms import ddp_comm_hooks
 
-            amp_type = get_amp_type(distributed_conf.comms_dtype)
-            if amp_type == torch.bfloat16:
-                hook = ddp_comm_hooks.default_hooks.bf16_compress_hook
-                logging.info("Enabling bfloat16 grad communication")
+    def _move_to_device(self):
+        print(
+            f"Moving components to device {self.device} and local rank {self.local_rank}."
+        )
+        self.model.to(self.device)
+
+        if self.loss:
+            copy_data_to_device(self.loss, self.device)
+        if self.scaler:
+            copy_data_to_device(self.scaler, self.device)
+        for meter in self._get_meters().values():
+            meter.set_sync_device(self.device)
+
+        print(
+            f"Done moving components to device {self.device} and local rank {self.local_rank}."
+        )
+
+    def _get_scalar_log_keys(self, phase):
+        if self.logging_conf.scalar_keys_to_log is not None:
+            return self.logging_conf.scalar_keys_to_log[phase].keys_to_log
+        else:
+            return []
+
+
+
+    def _init_model_initializer(self):
+        return instantiate(self.checkpoint_conf.model_weight_initializer)
+
+    def _call_model_initializer(self, model_weight_initializer):
+        if model_weight_initializer is not None:
+            logging.info(
+                f"Loading pretrained checkpoint from {self.checkpoint_conf.model_weight_initializer}"
+            )
+            self.model = model_weight_initializer(model=self.model)
+
+    def is_intermediate_val_epoch(self, epoch):
+        return epoch % self.val_epoch_freq == 0 and epoch < self.max_epochs - 1
+
+    def run(self):
+        mode = self.mode
+        assert mode in [
+            "train",
+            "val",
+        ]
+        if mode == "train":
+            self.run_train()
+            self.run_val()
+        elif mode == "val":
+            self.run_val()
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+    def run_train(self):
+        while self.epoch < self.max_epochs:
+            set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
+            
+            dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
+            
+            outs = self.train_epoch(dataloader)
+            
+            
+            import pdb;pdb.set_trace()
+            
+            self.tb_writer.log_dict(outs, self.epoch)  # Logged only on rank 0
+
+            # log train to text file.
+            if self.distributed_rank == 0:
+                with g_pathmgr.open(
+                    os.path.join(self.logging_conf.log_dir, "train_stats.json"),
+                    "a",
+                ) as f:
+                    f.write(json.dumps(outs) + "\n")
+
+            # Save checkpoint before validating
+            self.save_checkpoint(self.epoch)
+
+            del dataloader
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+
+            # Run val, not running on last epoch since will run after the
+            # loop anyway
+            if self.is_intermediate_val_epoch(self.epoch):
+                self.run_val()
+
+            # FIXME: best stats are not saved after the final epoch!
+            if self.distributed_rank == 0:
+                self.best_meter_values.update(self._get_trainer_state("train"))
+                with g_pathmgr.open(
+                    os.path.join(self.logging_conf.log_dir, "best_stats.json"),
+                    "a",
+                ) as f:
+                    f.write(json.dumps(self.best_meter_values) + "\n")
+
+            self.epoch += 1
+        # epoch was incremented in the loop but the val step runs out of the loop
+        self.epoch -= 1
+
+
+    def _get_trainer_state(self, phase):
+        return {
+            "Trainer/where": self.where,
+            "Trainer/epoch": self.epoch,
+            f"Trainer/steps_{phase}": self.steps[phase],
+        }
+
+    def train_epoch(self, train_loader):        
+        batch_time = AverageMeter("Batch Time", self.device, ":.2f")
+        data_time = AverageMeter("Data Time", self.device, ":.2f")
+        mem = AverageMeter("Mem (GB)", self.device, ":.2f")
+        data_times = []
+        phase = 'train'
+        
+        loss_names = ["objective"] + self._get_scalar_log_keys(phase)
+        loss_names = [f"Losses/{phase}_{name}" for name in loss_names]
+        loss_meters = {
+            name: AverageMeter(name, self.device, ":.2f") for name in loss_names
+        }
+        loss_meters["grad"] = AverageMeter("grad", self.device, ":.2f")
+
+        progress = ProgressMeter(
+            num_batches=len(train_loader),
+            meters=[
+                batch_time,
+                data_time,
+                mem,
+                self.time_elapsed_meter,
+                *loss_meters.values(),
+            ],
+            real_meters={},
+            prefix="Train Epoch: [{}]".format(self.epoch),
+        )
+
+        self.model.train()
+        end = time.time()
+
+        iters_per_epoch = len(train_loader)
+        limit_train_batches = (
+            iters_per_epoch
+            if self.limit_train_batches is None
+            else self.limit_train_batches
+        )
+
+        for data_iter, batch in enumerate(train_loader):
+            if data_iter > limit_train_batches:
+                break
+            
+            # measure data loading time
+            data_time.update(time.time() - end)
+            data_times.append(data_time.val)
+            
+            with torch.cuda.amp.autocast(enabled=False):
+                batch = self._process_batch(batch)
+
+            batch = copy_data_to_device(batch, self.device, non_blocking=True)
+
+            accum_steps = self.accum_steps
+
+            if accum_steps==1:
+                chunked_batches = [batch]
             else:
-                hook = ddp_comm_hooks.default_hooks.fp16_compress_hook
-                logging.info("Enabling fp16 grad communication")
-            process_group = None
-            self.model.register_comm_hook(process_group, hook)
+                chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
+
+            try:
+                self._run_steps_on_batch_chunks(
+                    chunked_batches, phase, loss_meters
+                )
+
+                # compute gradient and do SGD step
+                assert data_iter <= limit_train_batches  # allow for off by one errors
+                exact_epoch = self.epoch + float(data_iter) / limit_train_batches
+                self.where = float(exact_epoch) / self.max_epochs
+                
+                assert self.where <= 1 + self.EPSILON
+                if self.where < 1.0:
+                    for optim in self.optims:
+                        optim.step_schedulers(self.where)
+                else:
+                    logging.warning(
+                        f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
+                    )
+                        
+                # Log schedulers
+                if self.steps[phase] % self.logging_conf.log_freq == 0:
+                    for i, optim in enumerate(self.optims):
+                        for j, param_group in enumerate(optim.optimizer.param_groups):
+                            for option in optim.schedulers[j]:
+                                optim_prefix = (
+                                    f"{i}_"
+                                    if len(self.optims) > 1
+                                    else (
+                                        "" + f"{j}_"
+                                        if len(optim.optimizer.param_groups) > 1
+                                        else ""
+                                    )
+                                )
+                                self.tb_writer.log(
+                                    os.path.join("Optim", f"{optim_prefix}", option),
+                                    param_group[option],
+                                    self.steps[phase],
+                                )
+                    self.tb_writer.log(
+                        os.path.join("Optim", "where"),
+                        self.where,
+                        self.steps[phase],
+                    )
+
+                import pdb; pdb.set_trace()
+
+                # Clipping gradients and detecting diverging gradients
+                if self.gradient_clipper is not None:
+                    for optim in self.optims:
+                        self.scaler.unscale_(optim.optimizer)
+
+                    grad_norm = self.gradient_clipper(model=self.model)
+                    if grad_norm is not None:
+                        grad_norm_val = grad_norm.detach().item()
+                        loss_meters["grad"].update(grad_norm_val)
+                    else:
+                        loss_meters["grad"].update(0.0)
+
+                # Looking at the scale of the gradients after clipping
+                if self.gradient_logger is not None:
+                    self.gradient_logger(
+                        self.model, rank=self.distributed_rank, where=self.where
+                    )
+
+                # Optimizer step: the scaler will make sure gradients are not
+                # applied if the gradients are infinite
+
+                for optim in self.optims:
+                    self.scaler.step(optim.optimizer)
+                self.scaler.update()
+
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+
+                self.time_elapsed_meter.update(
+                    time.time() - self.start_time + self.ckpt_time_elapsed
+                )
+
+                mem.update(torch.cuda.max_memory_allocated() // 1e9)
+
+                if data_iter % self.logging_conf.log_freq == 0:
+                    progress.display(data_iter)
+
+                # If we reach here, our last batch has not diverged
+                last_batch_diverged = False
+
+                # End of profiler step
+                should_stop = self.profiler.step(data_iter)
+                if should_stop:
+                    break
+
+            # Catching NaN/Inf errors in the loss
+            except FloatingPointError as e:
+                # Diagnose the error in case of NaN
+                nan_detector = NanDetector(self.model, where=self.where)
+                # TODO - trace the scaler as well, to check if the NaN is coming from the scaler
+
+                with nan_detector:
+                    self._run_steps_on_batch_chunks(
+                        chunked_batches, phase, loss_meters, raise_on_error=False
+                    )
+                nan_report = nan_detector.error_report()
+                makedir(self.checkpoint_conf.save_dir)
+                file_name = f"nan_report_epoch{self.epoch}_iter{data_iter}.torch"
+                error_path = os.path.join(self.checkpoint_conf.save_dir, file_name)
+                with g_pathmgr.open(error_path, "wb") as f:
+                    torch.save(nan_report, f)
+
+
+                raise ValueError("FloatingPointError")
+                if last_batch_diverged:
+                    # If the last batch already has diverged, we stop there
+                    raise e
+                else:
+                    # Otherwise we try again with the next batch
+                    last_batch_diverged = True
+
+        should_stop = self.profiler.dump_stats()
+        if should_stop:
+            raise InterruptedError("End of profiling, stopping the training.")
+
+        self.est_epoch_time['train'] = batch_time.avg * iters_per_epoch
+        self._log_timers('train')
+        self._log_sync_data_times('train', data_times)
+
+        out_dict = self._log_meters_and_save_best_ckpts(['train'])
+
+        for k, v in loss_meters.items():
+            out_dict[k] = v.avg
+        out_dict.update(self._get_trainer_state(phase))
+        logging.info(f"Losses and meters: {out_dict}")
+        self._reset_meters([phase])
+        return out_dict
+
+
+    def _run_steps_on_batch_chunks(
+        self,
+        chunked_batches: List[Any],
+        phase: str,
+        loss_meters: Dict[str, AverageMeter],
+    ):
+        """
+        Run the forward / backward as many times as there are chunks in the batch,
+        accumulating the gradients on each backward
+        """        
+        
+        for optim in self.optims:   
+            optim.zero_grad(set_to_none=True)
+
+        accum_steps = len(chunked_batches)
+
+        amp_type = self.optim_conf.amp.amp_dtype
+        assert amp_type in ["bfloat16", "float16"], f"Invalid Amp type: {amp_type}"
+        if amp_type == "bfloat16":
+            amp_type = torch.bfloat16
+        else:
+            amp_type = torch.float16
+        
+        for i, chunked_batch in enumerate(chunked_batches):
+            ddp_context = (
+                self.model.no_sync()
+                if i < accum_steps - 1
+                else contextlib.nullcontext()
+            )
+
+            with ddp_context:
+                with torch.cuda.amp.autocast(
+                    enabled=self.optim_conf.amp.enabled,
+                    dtype=amp_type,
+                ):
+                    loss_dict = self._step(
+                        chunked_batch, self.model, phase, loss_meters
+                    )
+
+
+                loss = loss_dict["objective"]
+                loss_key = f"Losses/{phase}_objective"
+                batch_size = chunked_batch["images"].shape[0]
+
+                if not math.isfinite(loss.item()):
+                    error_msg = f"Loss is {loss.item()}, attempting to stop training"
+                    logging.error(error_msg)
+                    return
+
+                loss /= accum_steps
+                self.scaler.scale(loss).backward()
+                loss_meters[loss_key].update(loss.item(), batch_size)
+
+
+
+    def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
+        tensor_keys = [
+            "images", "depths", "extrinsics", "intrinsics", 
+            "cam_points", "world_points", "point_masks", 
+        ]        
+        string_keys = ["seq_name"]
+        
+        for key in tensor_keys:
+            if key in batch:
+                original_tensor = batch[key]
+                batch[key] = torch.concatenate([original_tensor, 
+                                                torch.flip(original_tensor, dims=[1])], 
+                                                dim=0)
+        
+        for key in string_keys:
+            if key in batch:
+                batch[key] = batch[key] + batch[key]
+        
+        return batch
+
+
+    def _process_batch(self, batch: Mapping):      
+        if self.data_conf.train.common_config.repeat_batch:
+            batch = self._apply_batch_repetition(batch)
+        
+        # Normalize camera extrinsics and points. The function returns new tensors.
+        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
+            normalize_camera_extrinsics_and_points_batch(
+                extrinsics=batch["extrinsics"],
+                cam_points=batch["cam_points"],
+                world_points=batch["world_points"],
+                depths=batch["depths"],
+                point_masks=batch["point_masks"],
+            )
+
+        # Replace the original values in the batch with the normalized ones.
+        batch["extrinsics"] = normalized_extrinsics
+        batch["cam_points"] = normalized_cam_points
+        batch["world_points"] = normalized_world_points
+        batch["depths"] = normalized_depths
+
+        return batch
+    
+    
+    
+    def _step(
+        self,
+        batch,
+        model: nn.Module,
+        phase: str,
+        loss_meters: dict[str, AverageMeter],
+    ):
+        # Forward run of the model
+        y_hat = model(images = batch["images"])
+        # Compute the loss
+        loss_dict = self.loss(y_hat, batch)
+        
+        # concatenate y_hat, loss_dict and batch for visualizations
+        y_hat_batch = {**y_hat, **loss_dict, **batch}
+
+        self._update_and_log_scalars(y_hat_batch, phase, self.steps[phase], loss_meters)
+
+        self._log_tb_visuals(y_hat_batch, phase, self.steps[phase])
+
+        self.steps[phase] += 1
+
+        return loss_dict
+
+
+
+    def _update_and_log_scalars(
+        self,
+        batch: Mapping,
+        phase: str,
+        step: int,
+        loss_meters: dict[str, AverageMeter],
+    ) -> None:
+        keys_to_log = self._get_scalar_log_keys(phase)
+        batch_size = batch['extrinsics'].shape[0]
+        for key in keys_to_log:
+            if key in batch:
+                value = batch[key].item() if torch.is_tensor(batch[key]) else batch[key]
+                loss_meters[f"Losses/{phase}_{key}"].update(value, batch_size)
+                if step % self.logging_conf.log_freq == 0:
+                    self.tb_writer.log(f"Values/{phase}/{key}", value, step)
+
+
+
+
+    def _log_tb_visuals(self, batch: Mapping, phase: str, step: int) -> None:
+        if not (
+            self.logging_conf.log_visuals
+            and (phase in self.logging_conf.log_visual_frequency)
+            and self.logging_conf.log_visual_frequency[phase] > 0
+            and (step % self.logging_conf.log_visual_frequency[phase] == 0)
+            and (self.logging_conf.visuals_keys_to_log is not None)
+        ):
+            return
+
+        if phase in self.logging_conf.visuals_keys_to_log:
+            keys_to_log = self.logging_conf.visuals_keys_to_log[phase][
+                "keys_to_log"
+            ]
+            assert (
+                len(keys_to_log) > 0
+            ), "Need to include some visual keys to log"
+            modality = self.logging_conf.visuals_keys_to_log[phase][
+                "modality"
+            ]
+            assert modality in [
+                "image",
+                "video",
+            ], "Currently only support video or image logging"
+
+            name = f"Visuals/{phase}"
+
+            visuals_to_log = torchvision.utils.make_grid(
+                [
+                    torchvision.utils.make_grid(
+                        batch[key][0],  # Ensure batch[key][0] is tensor and has at least 3 dimensions
+                        nrow=self.logging_conf.visuals_per_batch_to_log,
+                    )
+                    for key in keys_to_log if key in batch and batch[key][0].dim() >= 3
+                ],
+                nrow=1,
+            ).clamp(-1, 1)
+
+            visuals_to_log = visuals_to_log.cpu()
+            if visuals_to_log.dtype == torch.bfloat16:
+                visuals_to_log = visuals_to_log.to(torch.float16)
+            visuals_to_log = visuals_to_log.numpy()
+
+            self.tb_writer.log_visuals(
+                name, visuals_to_log, step, self.logging_conf.video_logging_fps
+            )
+
+
+
+def chunk_batch_for_accum_steps(batch, accum_steps: int):
+    return [get_chunk_from_data(batch, i, accum_steps) for i in range(accum_steps)]
+
+
+def is_sequence_of_primitives(data):
+    return (
+        isinstance(data, Sequence)
+        and not isinstance(data, str)
+        and len(data) > 0
+        and isinstance(data[0], (str, int, float, bool))
+    )
+
+
+def get_chunk_from_data(data, chunk_id, num_chunks):
+    """
+    Recursively splits all the tensors inside the passed data object into num_chunks.
+    """
+    if isinstance(data, torch.Tensor) or is_sequence_of_primitives(data):
+        # either a tensor or a list of primitive objects
+        # assert len(data) % num_chunks == 0
+        start = (len(data) // num_chunks) * chunk_id
+        end = (len(data) // num_chunks) * (chunk_id + 1)
+        return data[start:end]
+    elif isinstance(data, Mapping):
+        return {
+            key: get_chunk_from_data(value, chunk_id, num_chunks)
+            for key, value in data.items()
+        }
+    elif isinstance(data, str):
+        # NOTE: this is a hack to support string keys in the batch
+        return data
+    elif isinstance(data, Sequence):
+        return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
+    else:
+        return data
+

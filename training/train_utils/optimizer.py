@@ -5,196 +5,269 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import Any, Dict, List, Optional, Set, Union
+import itertools
+from typing import Any, Dict, List, Mapping, Iterable, Set, Tuple, Union
 
+import hydra
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
+from torch import Tensor
 
-
-def build_optimizer(model: nn.Module, config: DictConfig):
-    """
-    Main entry point for building optimizers.
-
-    Expected config structure:
-    ```
-    optimizer:
-      _target_: torch.optim.AdamW
-      lr: 1e-4
-      weight_decay: 0.05
-
-    # Optional scheduling
-    lr_schedule:
-      _target_: some.scheduler.Class
-
-    # Optional parameter grouping
-    param_groups:
-      lr:
-        "*.bias": 2.0  # 2x learning rate for bias terms
-      weight_decay:
-        "*.bias": 0.0  # no weight decay for bias
-    ```
-    """
-    return create_optimizer(
-        model=model,
-        optimizer_config=config.optimizer,
-        lr_schedule=config.get("lr_schedule"),
-        weight_decay_schedule=config.get("weight_decay_schedule"),
-        param_group_config=config.get("param_groups"),
-    )
-
-
+# -----------------------------------------------------------------------------
+# Optimizer wrapper
+# -----------------------------------------------------------------------------
 
 class OptimizerWrapper:
-    """Simple wrapper around PyTorch optimizers with scheduler support."""
+    """Wraps a torch.optim.Optimizer and its schedulers (if any)."""
 
-    def __init__(self, optimizer, schedulers=None):
+    def __init__(self, optimizer: torch.optim.Optimizer, schedulers=None) -> None:
         self.optimizer = optimizer
-        self.schedulers = schedulers or []
-        self._validate_schedulers()
+        self.schedulers = schedulers
+        self._validate_optimizer_schedulers()
         self.step_schedulers(0.0)
 
-    def _validate_schedulers(self):
-        """Validate that scheduler options exist in optimizer defaults."""
-        for scheduler_group in self.schedulers:
-            for option in scheduler_group.keys():
-                if option not in self.optimizer.defaults:
-                    raise ValueError(
-                        f"Optimizer option '{option}' not found. "
-                        f"Valid options: {list(self.optimizer.defaults.keys())}"
-                    )
+    # ---------------------------------------------------------------------
+    # Public API mirroring torch.optim.Optimizer
+    # ---------------------------------------------------------------------
 
-    def step_schedulers(self, progress: float):
-        """Update optimizer parameters based on training progress (0.0 to 1.0)."""
-        for i, param_group in enumerate(self.optimizer.param_groups):
-            if i < len(self.schedulers):
-                for option, scheduler in self.schedulers[i].items():
-                    param_group[option] = scheduler(progress)
-
-    def step(self, progress: float, closure=None):
-        """Step the optimizer and update schedulers."""
-        self.step_schedulers(progress)
+    def step(self, where: float = 1.0, closure=None):
+        """Update the optimizer & its schedulers."""
+        self.step_schedulers(where)
         return self.optimizer.step(closure)
 
     def zero_grad(self, *args, **kwargs):
         return self.optimizer.zero_grad(*args, **kwargs)
 
+    def _validate_optimizer_schedulers(self):
+        if self.schedulers is None:
+            return
+        for _, sched_map in enumerate(self.schedulers):
+            for option, _ in sched_map.items():
+                assert option in self.optimizer.defaults, (
+                    f"Optimizer option {option} not found in {self.optimizer}. "
+                    f"Valid options are {self.optimizer.defaults.keys()}"
+                )
 
-def create_param_groups(
-    model: nn.Module,
-    lr_config: Optional[Dict] = None,
-    weight_decay_config: Optional[Dict] = None,
-) -> List[Dict]:
-    """
-    Create parameter groups with different learning rates and weight decay.
-
-    Args:
-        model: PyTorch model
-        lr_config: Dict mapping parameter name patterns to learning rate multipliers
-        weight_decay_config: Dict mapping parameter name patterns to weight decay values
-
-    Returns:
-        List of parameter group dictionaries
-    """
-    if not lr_config and not weight_decay_config:
-        return [{"params": list(model.parameters())}]
-
-    param_groups = []
-    processed_params = set()
-
-    # Get all named parameters
-    named_params = dict(model.named_parameters())
-
-    # Process custom configurations
-    configs = {}
-    if lr_config:
-        configs.update({f"lr_{k}": v for k, v in lr_config.items()})
-    if weight_decay_config:
-        configs.update({f"wd_{k}": v for k, v in weight_decay_config.items()})
-
-    # Group parameters by their configuration
-    for config_name, config_value in configs.items():
-        matching_params = []
-        config_type = config_name.split('_')[0]  # 'lr' or 'wd'
-        pattern = '_'.join(config_name.split('_')[1:])
-
-        for param_name, param in named_params.items():
-            if param in processed_params:
-                continue
-            if _matches_pattern(param_name, pattern):
-                matching_params.append(param)
-                processed_params.add(param)
-
-        if matching_params:
-            group = {"params": matching_params}
-            if config_type == "lr":
-                group["lr_multiplier"] = config_value
-            elif config_type == "wd":
-                group["weight_decay"] = config_value
-            param_groups.append(group)
-
-    # Add remaining parameters to default group
-    remaining_params = [p for p in model.parameters() if p not in processed_params]
-    if remaining_params:
-        param_groups.append({"params": remaining_params})
-
-    return param_groups
+    def step_schedulers(self, where: float) -> None:
+        if self.schedulers is None:
+            return
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            for option, scheduler in self.schedulers[i].items():
+                param_group[option] = scheduler(where)
 
 
-def _matches_pattern(param_name: str, pattern: str) -> bool:
-    """Simple pattern matching for parameter names."""
-    import fnmatch
-    return fnmatch.fnmatch(param_name, pattern)
+# -----------------------------------------------------------------------------
+# Validation helpers
+# -----------------------------------------------------------------------------
 
 
-def create_optimizer(
-    model: nn.Module,
-    optimizer_config: DictConfig,
-    lr_schedule: Optional[Any] = None,
-    weight_decay_schedule: Optional[Any] = None,
-    param_group_config: Optional[Dict] = None,
-) -> OptimizerWrapper:
-    """
-    Create an optimizer with optional parameter grouping and scheduling.
+def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
+    """Ensure param groups are non-overlapping and include all model params."""
 
-    Args:
-        model: PyTorch model to optimize
-        optimizer_config: Hydra config for the optimizer (e.g., torch.optim.AdamW)
-        lr_schedule: Learning rate scheduler function
-        weight_decay_schedule: Weight decay scheduler function
-        param_group_config: Configuration for different parameter groups
+    for pg in param_groups:
+        assert len(pg["params"]) == len(set(pg["params"]))
 
-    Returns:
-        OptimizerWrapper instance
-    """
-    # Create parameter groups
-    if param_group_config:
-        param_groups = create_param_groups(
-            model,
-            param_group_config.get("lr"),
-            param_group_config.get("weight_decay")
+    parameters = [set(pg["params"]) for pg in param_groups]
+    model_parameters = {p for _, p in model.named_parameters()}
+
+    for p1, p2 in itertools.permutations(parameters, 2):
+        assert p1.isdisjoint(p2), "Parameter groups should be disjoint"
+
+    assert set.union(*parameters) == model_parameters, (
+        "Parameter groups must cover ALL model parameters "
+        f"(found {len(set.union(*parameters))} / {len(model_parameters)})"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Glob helpers for pattern matching
+# -----------------------------------------------------------------------------
+
+from wcmatch import fnmatch
+
+GLOB_FLAGS = (
+    fnmatch.CASE       # case-sensitive
+    | fnmatch.DOTMATCH # '*' also matches '.'
+    | fnmatch.EXTMATCH # extended patterns like *(foo|bar)
+    | fnmatch.SPLIT    # "pat1|pat2" works out-of-the-box
+)
+
+
+def get_full_parameter_name(module_name: str, param_name: str) -> str:
+    return param_name if module_name == "" else f"{module_name}.{param_name}"
+
+
+def get_module_cls_to_param_names(model: nn.Module) -> Dict[type, Set[str]]:
+    """Map each module class to the *immediate* param names it owns."""
+    mapping: Dict[type, Set[str]] = {}
+    for module_name, module in model.named_modules():
+        module_cls = type(module)
+        mapping.setdefault(module_cls, set())
+        for pname, _ in module.named_parameters(recurse=False):
+            mapping[module_cls].add(get_full_parameter_name(module_name, pname))
+    return mapping
+
+
+def unix_param_pattern_to_parameter_names(filter_param_names: Union[List[str], None],
+                                           parameter_names: Set[str]) -> Set[str]:
+    if filter_param_names is None:
+        return set()
+    allowed = []
+    for pat in filter_param_names:
+        matches = set(fnmatch.filter(parameter_names, pat, flags=GLOB_FLAGS))
+        if not matches:
+            raise AssertionError(f"Pattern {pat} matched no parameters")
+        logging.info(f"Matches for param pattern [{pat}]: {matches}")
+        allowed.append(matches)
+    return set.union(*allowed)
+
+
+def unix_module_cls_pattern_to_parameter_names(filter_module_cls_names: Union[List[str], None],
+                                               module_cls_to_param_names: Dict[type, Set[str]]) -> Set[str]:
+    if filter_module_cls_names is None:
+        return set()
+    allowed = []
+    for cls_name in filter_module_cls_names:
+        module_cls = hydra.utils.get_class(cls_name)
+        if module_cls not in module_cls_to_param_names:
+            raise AssertionError(f"Module class {cls_name} not found in model")
+        params = module_cls_to_param_names[module_cls]
+        if not params:
+            raise AssertionError(f"Module class {cls_name} has no parameters")
+        logging.info(f"Matches for module [{cls_name}]: {params}")
+        allowed.append(params)
+    return set.union(*allowed)
+
+
+def _unix_pattern_to_parameter_names(scheduler_cfg,
+                                     parameter_names: Set[str],
+                                     module_cls_to_param_names: Dict[type, Set[str]]):
+    if "param_names" not in scheduler_cfg and "module_cls_names" not in scheduler_cfg:
+        return None
+    return unix_param_pattern_to_parameter_names(
+        scheduler_cfg.get("param_names"), parameter_names
+    ).union(
+        unix_module_cls_pattern_to_parameter_names(
+            scheduler_cfg.get("module_cls_names"), module_cls_to_param_names
         )
-    else:
-        param_groups = [{"params": list(model.parameters())}]
+    )
 
-    # Instantiate optimizer
-    try:
-        import hydra
-        optimizer = hydra.utils.instantiate(optimizer_config, param_groups)
-    except ImportError:
-        # Fallback without hydra
-        optimizer_cls = optimizer_config._target_
-        optimizer_kwargs = {k: v for k, v in optimizer_config.items() if k != "_target_"}
-        optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
 
-    # Create schedulers
-    schedulers = []
-    for i, param_group in enumerate(param_groups):
-        group_schedulers = {}
-        if lr_schedule:
-            group_schedulers["lr"] = lr_schedule
-        if weight_decay_schedule:
-            group_schedulers["weight_decay"] = weight_decay_schedule
-        schedulers.append(group_schedulers)
+# -----------------------------------------------------------------------------
+# Scheduler helpers
+# -----------------------------------------------------------------------------
 
-    return OptimizerWrapper(optimizer, schedulers if any(schedulers) else None)
+
+def set_default_parameters(scheduler_cfgs: List[dict], all_parameter_names: Set[str]):
+    """Ensure exactly one scheduler per option acts as the default."""
+    specified = [cfg["parameter_names"] for cfg in scheduler_cfgs if cfg["parameter_names"]]
+
+    default_params = (
+        all_parameter_names if not specified else all_parameter_names - set.union(*specified)
+    )
+
+    default_count = 0
+    for cfg in scheduler_cfgs:
+        if cfg["parameter_names"] is None:
+            cfg["parameter_names"] = default_params
+            default_count += 1
+    assert default_count <= 1, "At most one default scheduler per option"
+
+    if default_count == 0:
+        scheduler_cfgs.append({"parameter_names": default_params})
+
+
+def name_constraints_to_parameters(param_constraints: List[Set[str]],
+                                   named_parameters: Dict[str, Tensor]) -> List[Tensor]:
+    matching_names = set.intersection(*param_constraints)
+    return [v for k, v in named_parameters.items() if k in matching_names]
+
+
+def map_scheduler_cfgs_to_param_groups(all_scheduler_cfgs: Iterable[List[dict]],
+                                       named_parameters: Dict[str, Tensor]):
+    """Produce param groups & schedulers that torch.optim can consume."""
+    schedulers: List[Dict[str, Any]] = []
+    param_groups: List[Dict[str, List[Tensor]]] = []
+
+    for cfgs in itertools.product(*all_scheduler_cfgs):
+        param_constraints = [cfg["parameter_names"] for cfg in cfgs]
+        matching = name_constraints_to_parameters(param_constraints, named_parameters)
+        if not matching:
+            continue  # no intersection of params for this combo
+        schedulers.append({cfg["option"]: cfg["scheduler"] for cfg in cfgs if "option" in cfg})
+        param_groups.append({"params": matching})
+
+    return schedulers, param_groups
+
+
+# -----------------------------------------------------------------------------
+# Public factory functions
+# -----------------------------------------------------------------------------
+
+
+def construct_optimizer(model: nn.Module,
+                        optimizer_conf: Any,
+                        options_conf: Union[Mapping[str, List], None] = None,
+                        param_group_modifiers_conf: Union[List, None] = None,
+                        validate_param_groups: bool = True) -> OptimizerWrapper:
+    """Build an OptimizerWrapper from hydra configs.
+
+    *No* allowlist handling – we always optimize *all* model parameters.
+    """
+
+    named_parameters = dict(model.named_parameters())
+    all_parameter_names = set(named_parameters.keys())
+    module_cls_to_all_param_names = get_module_cls_to_param_names(model)
+
+    # ──────────────────────────────────────────────────────────────────
+    # No scheduler case – simple & fast
+    # ──────────────────────────────────────────────────────────────────
+    if not options_conf:
+        optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
+        return OptimizerWrapper(optimizer)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Build option-specific scheduler configs
+    # ──────────────────────────────────────────────────────────────────
+    scheduler_cfgs_per_option = hydra.utils.instantiate(options_conf)
+    all_scheduler_cfgs: List[List[dict]] = []
+
+    for option, cfg_list in scheduler_cfgs_per_option.items():
+        for cfg in cfg_list:
+            cfg.option = option  # annotate
+            cfg.parameter_names = _unix_pattern_to_parameter_names(
+                cfg, all_parameter_names, module_cls_to_all_param_names
+            )
+        set_default_parameters(cfg_list, all_parameter_names)
+        all_scheduler_cfgs.append(cfg_list)
+
+    # User-provided modifiers (rare)
+    if param_group_modifiers_conf:
+        for modifier in param_group_modifiers_conf:
+            modifier = hydra.utils.instantiate(modifier)
+            all_scheduler_cfgs = modifier(scheduler_cfgs=all_scheduler_cfgs, model=model)
+
+    # Map scheduler cfg combos to optimizer param groups
+    schedulers, param_groups = map_scheduler_cfgs_to_param_groups(
+        all_scheduler_cfgs, named_parameters
+    )
+
+    if validate_param_groups:
+        validate_param_group_params(param_groups, model)
+
+    optimizer = hydra.utils.instantiate(optimizer_conf, param_groups)
+    return OptimizerWrapper(optimizer, schedulers)
+
+
+def construct_optimizers(model: nn.Module, optim_conf) -> Union[List[OptimizerWrapper], None]:
+    """Convenience wrapper producing a *single* OptimizerWrapper list."""
+    if optim_conf is None:
+        return None
+
+    optimizer = construct_optimizer(
+        model,
+        optim_conf.optimizer,
+        optim_conf.options,
+        validate_param_groups=True,
+    )
+    return [optimizer]

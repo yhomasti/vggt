@@ -15,7 +15,7 @@ data:
       load_track: False
       track_num: 1024
       training: True
-      inside_random: False
+      inside_random: True
       img_size: 224
       patch_size: 14
       rescale: True
@@ -25,6 +25,8 @@ data:
       get_nearby: True
       load_depth: True
       img_nums: [2, 24]
+      allow_duplicate_img: True
+      repeat_batch: False
 
       augs:
         cojitter: True
@@ -53,7 +55,7 @@ data:
       load_track: False
       track_num: 1024
       training: False
-      inside_random: False
+      inside_random: True
       img_size: 224
       patch_size: 14
       rescale: True
@@ -63,6 +65,7 @@ data:
       get_nearby: True
       load_depth: True
       img_nums: [2, 12]
+      allow_duplicate_img: True
 
       augs:
         cojitter: False

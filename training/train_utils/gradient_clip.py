@@ -27,14 +27,11 @@ class GradientClipper:
                 'norm_type': config.get('norm_type', 2)
             })
 
-
     def __call__(self, model: nn.Module) -> Optional[torch.Tensor]:
         # TODO: fix this, only record the parameter names once
+
         import pdb;pdb.set_trace()
 
-
-        if self.max_norm is None:
-            return None  # no-op
 
         # First, collect all parameters that should be clipped based on module names
         params_to_clip_by_config = []
