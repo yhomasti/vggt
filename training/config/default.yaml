@@ -83,8 +83,8 @@ logging:
 
 
 checkpoint:
-  save_dir: logs/${exp_name}
-  save_freq: 10
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
   resume_checkpoint_path: /fsx-repligen/jianyuan/transfer_buffer/ckpts/model.pt
   strict: False
 
@@ -126,7 +126,7 @@ optim:
   gradient_clip:
     _target_: train_utils.gradient_clip.GradientClipper
     configs:
-      - module_name: "aggregator"
+      - module_name: ["aggregator"]
         max_norm: 1.0   # feel free to reduce this if you see instabilities
         norm_type: 2
       - module_name: ["depth"]

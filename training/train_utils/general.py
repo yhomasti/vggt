@@ -52,10 +52,6 @@ def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
 
     # Apply hard clamping if specified
     if hard_max is not None:
-        values_out_of_range = (input_tensor > hard_max).any() or (input_tensor < -hard_max).any()
-        if values_out_of_range:
-            logging.warning(f"Tensor {loss_name} contains values outside range [-{hard_max}, {hard_max}]. Clamping.")
-        
         input_tensor = torch.clamp(input_tensor, min=-hard_max, max=hard_max)
 
     return input_tensor

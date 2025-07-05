@@ -57,6 +57,8 @@ from train_utils.distributed import get_machine_local_and_dist_rank
 from train_utils.freeze import freeze_modules
 from train_utils.optimizer import construct_optimizers
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
+from train_utils.checkpoint import DDPCheckpointSaver
+
 
 class Trainer:
     """
@@ -135,7 +137,7 @@ class Trainer:
         if self.scaler:
             copy_data_to_device(self.scaler, self.device)
 
-        self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
+        self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
 
         if self.mode != "val":
             self.optims = construct_optimizers(
@@ -163,6 +165,18 @@ class Trainer:
         self.start_time = time.time()
         self.ckpt_time_elapsed = 0
 
+
+    def _get_meters(self, phase_filters=None):
+        if self.meters is None:
+            return {}
+        meters = {}
+        for phase, phase_meters in self.meters.items():
+            if phase_filters is not None and phase not in phase_filters:
+                continue
+            for key, key_meters in phase_meters.items():
+                for name, meter in key_meters.items():
+                    meters[f"{phase}_{key}/{name}"] = meter
+        return meters
 
 
     def _setup_env_variables(self, env_variables_conf) -> None:
@@ -236,7 +250,6 @@ class Trainer:
         logging.info("Setting up components: Model, loss, optim, meters etc.")
         self.epoch = 0
         self.steps = {'train': 0, 'val': 0}
-        self.prev_epoch_data_ids = {'train': None, 'val': None}
 
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
         self.model = instantiate(self.model_conf, _recursive_=False)
@@ -319,6 +332,56 @@ class Trainer:
             f"Done moving components to device {self.device} and local rank {self.local_rank}."
         )
 
+    def save_checkpoint(self, epoch, checkpoint_names=None):        
+        checkpoint_folder = self.checkpoint_conf.save_dir
+        safe_makedirs(checkpoint_folder)
+        if checkpoint_names is None:
+            checkpoint_names = ["checkpoint"]
+            if (
+                self.checkpoint_conf.save_freq > 0
+                and int(epoch) % self.checkpoint_conf.save_freq == 0
+                and (int(epoch) > 0 or self.checkpoint_conf.save_freq == 1)
+            ):
+                checkpoint_names.append(f"checkpoint_{int(epoch)}")
+
+        checkpoint_content = {
+            "prev_epoch": epoch,
+            "steps": self.steps,
+            "time_elapsed": self.time_elapsed_meter.val,
+            "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
+        }
+        
+        if len(self.optims) == 1:
+            checkpoint_content["optimizer"] = checkpoint_content["optimizer"][0]
+        if self.optim_conf.amp.enabled:
+            checkpoint_content["scaler"] = self.scaler.state_dict()
+
+        # Save the checkpoint for DDP only
+        saver = DDPCheckpointSaver(
+            checkpoint_folder,
+            checkpoint_names=checkpoint_names,
+            rank=self.distributed_rank,
+            epoch=epoch,
+        )
+
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            model = self.model.module
+
+        saver.save_checkpoint(
+            model=model,
+            ema_models = None,
+            skip_saving_parameters=[],
+            **checkpoint_content,
+        )
+
+
+
+    def _get_train_dataset_checkpoint_state(self):
+        if self.train_dataset is not None:
+            return self.train_dataset.get_checkpoint_state()
+        return None
+
+
     def _get_scalar_log_keys(self, phase):
         if self.logging_conf.scalar_keys_to_log is not None:
             return self.logging_conf.scalar_keys_to_log[phase].keys_to_log
@@ -360,21 +423,8 @@ class Trainer:
             
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             
-            outs = self.train_epoch(dataloader)
+            self.train_epoch(dataloader)
             
-            
-            import pdb;pdb.set_trace()
-            
-            self.tb_writer.log_dict(outs, self.epoch)  # Logged only on rank 0
-
-            # log train to text file.
-            if self.distributed_rank == 0:
-                with g_pathmgr.open(
-                    os.path.join(self.logging_conf.log_dir, "train_stats.json"),
-                    "a",
-                ) as f:
-                    f.write(json.dumps(outs) + "\n")
-
             # Save checkpoint before validating
             self.save_checkpoint(self.epoch)
 
@@ -383,25 +433,170 @@ class Trainer:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-
-            # Run val, not running on last epoch since will run after the
-            # loop anyway
-            if self.is_intermediate_val_epoch(self.epoch):
-                self.run_val()
-
-            # FIXME: best stats are not saved after the final epoch!
-            if self.distributed_rank == 0:
-                self.best_meter_values.update(self._get_trainer_state("train"))
-                with g_pathmgr.open(
-                    os.path.join(self.logging_conf.log_dir, "best_stats.json"),
-                    "a",
-                ) as f:
-                    f.write(json.dumps(self.best_meter_values) + "\n")
-
             self.epoch += 1
-        # epoch was incremented in the loop but the val step runs out of the loop
         self.epoch -= 1
 
+    @torch.no_grad()
+    def _dump_model_stats_for_tests(self):
+        # Done on all ranks because of FSDP and also for debugging DDP
+        logging.info("Dumping stats of the trained model")
+        stats = {
+            "epoch": self.epoch,
+            "rank": self.distributed_rank,
+            "model": sum(p.sum() for p in self.model.parameters()).item(),
+        }
+        with g_pathmgr.open(
+            os.path.join(
+                self.logging_conf.log_dir,
+                f"unit_tests_model_stats_{self.distributed_rank}.json",
+            ),
+            "a",
+        ) as f:
+            f.write(json.dumps(stats) + "\n")
+
+    def run_val(self):
+        if not self.val_dataset:
+            return
+
+        dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
+        is_fresh_epoch = self.val_dataset.is_fresh_epoch(epoch=int(self.epoch))
+        outs = self.val_epoch(dataloader, is_fresh_epoch)
+        del dataloader
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        self.tb_writer.log_dict(outs, self.epoch)  # Logged only on rank 0
+
+        if self.distributed_rank == 0:
+            with g_pathmgr.open(
+                os.path.join(self.logging_conf.log_dir, "val_stats.json"),
+                "a",
+            ) as f:
+                f.write(json.dumps(outs) + "\n")
+
+    def val_epoch(self, val_loader, is_fresh_epoch):
+        batch_time = AverageMeter("Batch Time", self.device, ":.4f")
+        data_time = AverageMeter("Data Time", self.device, ":.4f")
+        mem = AverageMeter("Mem (GB)", self.device, ":.4f")
+        data_times = []
+
+        iters_per_epoch = len(val_loader)
+
+        curr_phases = ['val']
+        curr_models = [self.model]
+
+        assert len(curr_phases)==1
+
+        phase = curr_phases[0]
+        loss_names = ["objective"] + self._get_scalar_log_keys(phase)
+        loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
+        
+        loss_meters = {
+            name: AverageMeter(name, self.device, ":.4f") for name in loss_names
+        }
+
+        for model in curr_models:
+            with self._to_full_val_model(model):
+                model.eval()
+                if hasattr(
+                    unwrap_ddp_or_fsdp_if_wrapped(model), "on_validation_epoch_start"
+                ):
+                    unwrap_ddp_or_fsdp_if_wrapped(model).on_validation_epoch_start()
+
+        # we track the data indices to ensure we are getting proper number of samples
+        # with expected shuffling
+        local_data_ids = []
+
+        progress = ProgressMeter(
+            iters_per_epoch,
+            [batch_time, data_time, mem,
+            self.time_elapsed_meter,
+            *loss_meters.values(),],
+            self._get_meters(curr_phases),
+            prefix="Val Epoch: [{}]".format(self.epoch),
+        )
+
+        end = time.time()
+
+        limit_val_batches = (
+            iters_per_epoch
+            if self.limit_val_batches is None
+            else self.limit_val_batches
+        )
+
+        for data_iter, batch in enumerate(val_loader):
+            if data_iter > limit_val_batches:
+                break
+
+            # measure data loading time
+            data_time.update(time.time() - end)
+            data_times.append(data_time.val)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                batch = self._process_batch(batch, 'val', local_data_ids)
+            batch = copy_data_to_device(batch, self.device)
+
+            import pdb; pdb.set_trace()
+            # compute output
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(
+                    enabled=self.optim_conf.amp.enabled,
+                    dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+                ):
+                    for phase, model in zip(curr_phases, curr_models):
+                        with self._to_full_val_model(model):
+                            self._step(
+                                batch,
+                                model,
+                                phase,
+                                loss_meters,
+                            )
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            self.time_elapsed_meter.update(
+                time.time() - self.start_time + self.ckpt_time_elapsed
+            )
+
+            if torch.cuda.is_available():
+                mem.update(torch.cuda.max_memory_allocated() // 1e9)
+
+            if data_iter % self.logging_conf.log_freq == 0:
+                progress.display(data_iter)
+
+        self.est_epoch_time['val'] = batch_time.avg * iters_per_epoch
+        self._log_sync_data_times('val', data_times)
+
+        for model in curr_models:
+            with self._to_full_val_model(model):
+                if hasattr(
+                    unwrap_ddp_or_fsdp_if_wrapped(model), "on_validation_epoch_end"
+                ):
+                    unwrap_ddp_or_fsdp_if_wrapped(model).on_validation_epoch_end()
+
+        out_dict = self._log_meters_and_save_best_ckpts(curr_phases)
+
+        for phase in curr_phases:
+            out_dict.update(self._get_trainer_state(phase))
+
+        for k, v in loss_meters.items():
+            out_dict[k] = v.avg
+
+        self._reset_meters(curr_phases)
+        logging.info(f"Meters: {out_dict}")
+        return out_dict
+
+
+
+
+    @contextlib.contextmanager
+    def _to_full_val_model(self, model):
+        # Simplified since we only support standard DDP models
+        # No special handling needed for DDP models during validation
+        yield
 
     def _get_trainer_state(self, phase):
         return {
@@ -410,19 +605,25 @@ class Trainer:
             f"Trainer/steps_{phase}": self.steps[phase],
         }
 
+
+
     def train_epoch(self, train_loader):        
-        batch_time = AverageMeter("Batch Time", self.device, ":.2f")
-        data_time = AverageMeter("Data Time", self.device, ":.2f")
-        mem = AverageMeter("Mem (GB)", self.device, ":.2f")
+        batch_time = AverageMeter("Batch Time", self.device, ":.4f")
+        data_time = AverageMeter("Data Time", self.device, ":.4f")
+        mem = AverageMeter("Mem (GB)", self.device, ":.4f")
         data_times = []
         phase = 'train'
         
-        loss_names = ["objective"] + self._get_scalar_log_keys(phase)
-        loss_names = [f"Losses/{phase}_{name}" for name in loss_names]
+        loss_names = self._get_scalar_log_keys(phase)
+        loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
         loss_meters = {
-            name: AverageMeter(name, self.device, ":.2f") for name in loss_names
+            name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
-        loss_meters["grad"] = AverageMeter("grad", self.device, ":.2f")
+        
+        for config in self.gradient_clipper.configs: 
+            param_names = ",".join(config['module_names'])
+            loss_meters[f"Grad/{param_names}"] = AverageMeter(f"Grad/{param_names}", self.device, ":.4f")
+
 
         progress = ProgressMeter(
             num_batches=len(train_loader),
@@ -446,6 +647,10 @@ class Trainer:
             if self.limit_train_batches is None
             else self.limit_train_batches
         )
+        
+        if self.gradient_clipper is not None:
+            # setup gradient clipping at the beginning of training
+            self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
@@ -467,140 +672,77 @@ class Trainer:
             else:
                 chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
 
-            try:
-                self._run_steps_on_batch_chunks(
-                    chunked_batches, phase, loss_meters
-                )
+            self._run_steps_on_batch_chunks(
+                chunked_batches, phase, loss_meters
+            )
 
-                # compute gradient and do SGD step
-                assert data_iter <= limit_train_batches  # allow for off by one errors
-                exact_epoch = self.epoch + float(data_iter) / limit_train_batches
-                self.where = float(exact_epoch) / self.max_epochs
-                
-                assert self.where <= 1 + self.EPSILON
-                if self.where < 1.0:
-                    for optim in self.optims:
-                        optim.step_schedulers(self.where)
-                else:
-                    logging.warning(
-                        f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
-                    )
-                        
-                # Log schedulers
-                if self.steps[phase] % self.logging_conf.log_freq == 0:
-                    for i, optim in enumerate(self.optims):
-                        for j, param_group in enumerate(optim.optimizer.param_groups):
-                            for option in optim.schedulers[j]:
-                                optim_prefix = (
-                                    f"{i}_"
-                                    if len(self.optims) > 1
-                                    else (
-                                        "" + f"{j}_"
-                                        if len(optim.optimizer.param_groups) > 1
-                                        else ""
-                                    )
-                                )
-                                self.tb_writer.log(
-                                    os.path.join("Optim", f"{optim_prefix}", option),
-                                    param_group[option],
-                                    self.steps[phase],
-                                )
-                    self.tb_writer.log(
-                        os.path.join("Optim", "where"),
-                        self.where,
-                        self.steps[phase],
-                    )
-
-                import pdb; pdb.set_trace()
-
-                # Clipping gradients and detecting diverging gradients
-                if self.gradient_clipper is not None:
-                    for optim in self.optims:
-                        self.scaler.unscale_(optim.optimizer)
-
-                    grad_norm = self.gradient_clipper(model=self.model)
-                    if grad_norm is not None:
-                        grad_norm_val = grad_norm.detach().item()
-                        loss_meters["grad"].update(grad_norm_val)
-                    else:
-                        loss_meters["grad"].update(0.0)
-
-                # Looking at the scale of the gradients after clipping
-                if self.gradient_logger is not None:
-                    self.gradient_logger(
-                        self.model, rank=self.distributed_rank, where=self.where
-                    )
-
-                # Optimizer step: the scaler will make sure gradients are not
-                # applied if the gradients are infinite
-
+            # compute gradient and do SGD step
+            assert data_iter <= limit_train_batches  # allow for off by one errors
+            exact_epoch = self.epoch + float(data_iter) / limit_train_batches
+            self.where = float(exact_epoch) / self.max_epochs
+            
+            assert self.where <= 1 + self.EPSILON
+            if self.where < 1.0:
                 for optim in self.optims:
-                    self.scaler.step(optim.optimizer)
-                self.scaler.update()
-
-                # measure elapsed time
-                batch_time.update(time.time() - end)
-                end = time.time()
-
-                self.time_elapsed_meter.update(
-                    time.time() - self.start_time + self.ckpt_time_elapsed
+                    optim.step_schedulers(self.where)
+            else:
+                logging.warning(
+                    f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
+                )
+                    
+            # Log schedulers
+            if self.steps[phase] % self.logging_conf.log_freq == 0:
+                for i, optim in enumerate(self.optims):
+                    for j, param_group in enumerate(optim.optimizer.param_groups):
+                        for option in optim.schedulers[j]:
+                            optim_prefix = (
+                                f"{i}_"
+                                if len(self.optims) > 1
+                                else (
+                                    "" + f"{j}_"
+                                    if len(optim.optimizer.param_groups) > 1
+                                    else ""
+                                )
+                            )
+                            self.tb_writer.log(
+                                os.path.join("Optim", f"{optim_prefix}", option),
+                                param_group[option],
+                                self.steps[phase],
+                            )
+                self.tb_writer.log(
+                    os.path.join("Optim", "where"),
+                    self.where,
+                    self.steps[phase],
                 )
 
-                mem.update(torch.cuda.max_memory_allocated() // 1e9)
+            # Clipping gradients and detecting diverging gradients
+            if self.gradient_clipper is not None:
+                for optim in self.optims:
+                    self.scaler.unscale_(optim.optimizer)
 
-                if data_iter % self.logging_conf.log_freq == 0:
-                    progress.display(data_iter)
+                grad_norm_dict = self.gradient_clipper(model=self.model)
 
-                # If we reach here, our last batch has not diverged
-                last_batch_diverged = False
+                for key, grad_norm in grad_norm_dict.items():
+                    loss_meters[f"Grad/{key}"].update(grad_norm)
 
-                # End of profiler step
-                should_stop = self.profiler.step(data_iter)
-                if should_stop:
-                    break
+            # Optimizer step
+            for optim in self.optims:   
+                self.scaler.step(optim.optimizer)
+            self.scaler.update()
 
-            # Catching NaN/Inf errors in the loss
-            except FloatingPointError as e:
-                # Diagnose the error in case of NaN
-                nan_detector = NanDetector(self.model, where=self.where)
-                # TODO - trace the scaler as well, to check if the NaN is coming from the scaler
+            # Measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+            self.time_elapsed_meter.update(
+                time.time() - self.start_time + self.ckpt_time_elapsed
+            )
+            mem.update(torch.cuda.max_memory_allocated() // 1e9)
 
-                with nan_detector:
-                    self._run_steps_on_batch_chunks(
-                        chunked_batches, phase, loss_meters, raise_on_error=False
-                    )
-                nan_report = nan_detector.error_report()
-                makedir(self.checkpoint_conf.save_dir)
-                file_name = f"nan_report_epoch{self.epoch}_iter{data_iter}.torch"
-                error_path = os.path.join(self.checkpoint_conf.save_dir, file_name)
-                with g_pathmgr.open(error_path, "wb") as f:
-                    torch.save(nan_report, f)
+            if data_iter % self.logging_conf.log_freq == 0:
+                progress.display(data_iter)
 
+        return True
 
-                raise ValueError("FloatingPointError")
-                if last_batch_diverged:
-                    # If the last batch already has diverged, we stop there
-                    raise e
-                else:
-                    # Otherwise we try again with the next batch
-                    last_batch_diverged = True
-
-        should_stop = self.profiler.dump_stats()
-        if should_stop:
-            raise InterruptedError("End of profiling, stopping the training.")
-
-        self.est_epoch_time['train'] = batch_time.avg * iters_per_epoch
-        self._log_timers('train')
-        self._log_sync_data_times('train', data_times)
-
-        out_dict = self._log_meters_and_save_best_ckpts(['train'])
-
-        for k, v in loss_meters.items():
-            out_dict[k] = v.avg
-        out_dict.update(self._get_trainer_state(phase))
-        logging.info(f"Losses and meters: {out_dict}")
-        self._reset_meters([phase])
-        return out_dict
 
 
     def _run_steps_on_batch_chunks(
@@ -644,7 +786,7 @@ class Trainer:
 
 
                 loss = loss_dict["objective"]
-                loss_key = f"Losses/{phase}_objective"
+                loss_key = f"Loss/{phase}_loss_objective"
                 batch_size = chunked_batch["images"].shape[0]
 
                 if not math.isfinite(loss.item()):
@@ -655,6 +797,12 @@ class Trainer:
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
                 loss_meters[loss_key].update(loss.item(), batch_size)
+
+
+
+    def _reset_meters(self, phases: str) -> None:
+        for meter in self._get_meters(phases).values():
+            meter.reset()
 
 
 
@@ -740,7 +888,7 @@ class Trainer:
         for key in keys_to_log:
             if key in batch:
                 value = batch[key].item() if torch.is_tensor(batch[key]) else batch[key]
-                loss_meters[f"Losses/{phase}_{key}"].update(value, batch_size)
+                loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0:
                     self.tb_writer.log(f"Values/{phase}/{key}", value, step)
 
