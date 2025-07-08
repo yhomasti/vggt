@@ -163,27 +163,25 @@ def calculate_auc_np(r_error, t_error, max_threshold=30):
 def se3_to_relative_pose_error(pred_se3, gt_se3, num_frames):
     """
     Compute rotation and translation errors between predicted and ground truth poses.
+    This function assumes the input poses are world-to-camera (w2c) transformations.
 
     Args:
-        pred_se3: Predicted SE(3) transformations
-        gt_se3: Ground truth SE(3) transformations
-        num_frames: Number of frames
+        pred_se3: Predicted SE(3) transformations (w2c), shape (N, 4, 4)
+        gt_se3: Ground truth SE(3) transformations (w2c), shape (N, 4, 4)
+        num_frames: Number of frames (N)
 
     Returns:
         Rotation and translation angle errors in degrees
     """
     pair_idx_i1, pair_idx_i2 = build_pair_index(num_frames)
 
-    # Compute relative camera poses between pairs
-    # We use closed_form_inverse to avoid potential numerical loss by torch.inverse()
-    relative_pose_gt = closed_form_inverse_se3(gt_se3[pair_idx_i1]).bmm(
-        gt_se3[pair_idx_i2]
+    relative_pose_gt = gt_se3[pair_idx_i1].bmm(
+        closed_form_inverse_se3(gt_se3[pair_idx_i2])
     )
-    relative_pose_pred = closed_form_inverse_se3(pred_se3[pair_idx_i1]).bmm(
-        pred_se3[pair_idx_i2]
+    relative_pose_pred = pred_se3[pair_idx_i1].bmm(
+        closed_form_inverse_se3(pred_se3[pair_idx_i2])
     )
 
-    # Compute the difference in rotation and translation
     rel_rangle_deg = rotation_angle(
         relative_pose_gt[:, :3, :3], relative_pose_pred[:, :3, :3]
     )
@@ -192,21 +190,6 @@ def se3_to_relative_pose_error(pred_se3, gt_se3, num_frames):
     )
 
     return rel_rangle_deg, rel_tangle_deg
-
-
-def align_to_first_camera(camera_poses):
-    """
-    Align all camera poses to the first camera's coordinate frame.
-
-    Args:
-        camera_poses: Tensor of shape (N, 4, 4) containing camera poses as SE3 transformations
-
-    Returns:
-        Tensor of shape (N, 4, 4) containing aligned camera poses
-    """
-    first_cam_extrinsic_inv = closed_form_inverse_se3(camera_poses[0][None])
-    aligned_poses = torch.matmul(camera_poses, first_cam_extrinsic_inv)
-    return aligned_poses
 
 
 def setup_args():
@@ -330,12 +313,8 @@ def process_sequence(model, seq_name, seq_data, category, co3d_dir, min_num_imag
         pred_se3 = torch.cat((pred_extrinsic, add_row), dim=1)
         gt_se3 = torch.cat((gt_extrinsic, add_row), dim=1)
 
-        # Set the coordinate of the first camera as the coordinate of the world
-        # NOTE: DO NOT REMOVE THIS UNLESS YOU KNOW WHAT YOU ARE DOING
-        pred_se3 = align_to_first_camera(pred_se3)
-        gt_se3 = align_to_first_camera(gt_se3)
-
         rel_rangle_deg, rel_tangle_deg = se3_to_relative_pose_error(pred_se3, gt_se3, num_frames)
+
 
         Racc_5 = (rel_rangle_deg < 5).float().mean().item()
         Tacc_5 = (rel_tangle_deg < 5).float().mean().item()

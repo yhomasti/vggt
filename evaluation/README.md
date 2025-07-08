@@ -53,7 +53,9 @@ python preprocess_co3d.py --category all \
     --output_dir /YOUR/CO3D/ANNO/PATH
 ```
 
-   Replace `/YOUR/CO3D/PATH` with the path to your downloaded Co3D dataset, and `/YOUR/CO3D/ANNO/PATH` with the desired output directory for the processed annotations.
+   Replace `/YOUR/CO3D/PATH` with the path to your downloaded Co3D dataset, and `/YOUR/CO3D/ANNO/PATH` with the desired output directory for the processed annotations. Note that the processed data here uses the PyTorch3D camera convention, while the annotation files we provided for training on Hugging Face have already been converted to the OpenCV convention.
+
+
 
 ### Running the Evaluation
 
@@ -76,7 +78,7 @@ python test_co3d.py \
     --use_ba
 ```
 
-   
+
 
 
 ### Expected Results
@@ -87,16 +89,16 @@ Full evaluation on Co3D can take a long time. For faster trials, you can run wit
 Use `--fast_eval` to test on a subset of data (max 10 sequences per category):
 
 - Feed-forward estimation:
-  - AUC@30: 89.45
-  - AUC@15: 83.29
-  - AUC@5: 66.86
-  - AUC@3: 56.08
+  - AUC@30: 89.98
+  - AUC@15: 83.89
+  - AUC@5: 67.45
+  - AUC@3: 56.65
 
 - With Bundle Adjustment (`--use_ba`):
-  - AUC@30: 90.11
-  - AUC@15: 84.39
-  - AUC@5: 70.02
-  - AUC@3: 60.51
+  - AUC@30: 90.52
+  - AUC@15: 85.08
+  - AUC@5: 70.69
+  - AUC@3: 61.32
 
 #### Full Evaluation
 
@@ -104,15 +106,3 @@ Use `--fast_eval` to test on a subset of data (max 10 sequences per category):
 - With Bundle Adjustment, you can expect a Mean AUC@30 between 90.5% and 92.5%
 
 > **Note:** For simplicity, this script did not optimize the inference speed, so timing results may differ from those reported in the paper. For example, when using ba, keypoint extractor models are re-initialized for each sequence rather than being loaded once.
-
-## Checklist
-
-The following features are planned for future releases:
-
-- [x] Camera pose estimation code on Co3D
-- [x] VGGT+BA (Bundle Adjustment) on Co3D
-- [ ] Evaluation on Re10K dataset
-- [ ] Evaluation on IMC dataset
-- [ ] Evaluation of multi-view depth estimation
-
----
