@@ -1,44 +1,15 @@
 """
-Test Realtime VGGT Pose Server (scaffold)
-----------------------------------------
+Test Realtime VGGT Pose Server (optimized)
+------------------------------------------
 
-Goal
-====
-Accept frames from HoloLens/Unity via HTTP POST (multipart-form), keep a
-small sliding window in memory, run VGGT on that window, and print the
-latest frame's camera pose + timing to the terminal. No GLB export.
+Key speed-ups vs previous version:
+ - In-memory preprocessing (no disk PNG round-trip)
+ - Warmup pass on startup (CUDA/cuDNN JIT, allocator priming)
+ - Gradio-like resize (width=518), white padding to common HxW
+ - AMP autocast + TF32 (when available), cuDNN benchmark on
+ - Smaller window/cadence defaults for dev
 
-How to run
-==========
-# 1) Install deps (examples)
-#    pip install fastapi uvicorn[standard] pillow numpy opencv-python torch
-#    (VGGT repo deps must already be installed; run in your vggt env)
-#
-# 2) Start server
-#    python test_realtime.py --host 0.0.0.0 --port 8000 --window 8 --cadence-ms 250
-#
-# 3) Unity/HoloLens client POSTs to:
-#    POST http://<server>:8000/frame
-#    Content-Type: multipart/form-data
-#    Fields:
-#      - image: binary (PNG/JPEG)
-#      - metadata: JSON string with keys below
-#
-#    metadata schema:
-#    {
-#      "frame_id": 123,
-#      "timestamp_ms": 1690000000000,
-#      "intrinsics": {"fx":..., "fy":..., "cx":..., "cy":..., "width":..., "height":...,
-#                      "distortion": [k1,k2,p1,p2,k3] or null },
-#      "session_id": "optional-session-key"  // start new to reset origin/buffer
-#    }
-#
-# Integration notes
-# =================
-# Replace the placeholder `vggt_infer_poses(...)` to call your actual VGGT
-# code path that returns camera-to-world (R, t) for every image in the window.
-# Keep the server in right-handed coordinates. If/when you stream to Unity,
-# do LH/RH conversion on the Unity side.
+API is unchanged.
 """
 
 from __future__ import annotations
@@ -58,16 +29,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-# --- VGGT imports (adjust paths to your repo layout as needed) ---
 import os
-import tempfile
-import shutil
 import torch
+import torch.nn.functional as F
+from torchvision import transforms as TF
+
+# --- VGGT imports (repo local) ---
 import sys
 sys.path.append("vggt/")
 from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
 
 # --------------------------- Data Models ---------------------------
 @dataclass
@@ -106,10 +78,10 @@ def parse_metadata(meta_json: str) -> Tuple[int, int, Intrinsics, Optional[str]]
     return frame_id, timestamp_ms, intrinsics, session_id
 
 
-def pil_to_numpy_rgb(img: Image.Image) -> np.ndarray:
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return np.asarray(img)
+def pil_from_numpy_rgb(arr: np.ndarray) -> Image.Image:
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 RGB array, got {arr.shape}")
+    return Image.fromarray(arr, mode="RGB")
 
 
 def make_K(intr: Intrinsics) -> np.ndarray:
@@ -119,6 +91,69 @@ def make_K(intr: Intrinsics) -> np.ndarray:
     return K
 
 
+# ------------------- Gradio-like In-Memory Preproc -----------------
+# Matches semantics of vggt.utils.load_fn.load_and_preprocess_images(mode="crop"):
+# - Set WIDTH=518, keep aspect (BICUBIC)
+# - If resulting height > 518, center-crop to 518
+# - If images in the batch have different (H, W), white-pad to the max H/W
+# - Pad to be divisible by 14 (safe for the model), using white value
+TO_TENSOR = TF.ToTensor()  # [0,1]
+TARGET_W = 518             # Gradio uses 518 width
+TARGET_H = 518             # crop height if exceeding this
+DIVIS = 14                 # make dims divisible by 14
+
+def _resize_crop_tensor(img_pil: Image.Image) -> torch.Tensor:
+    w, h = img_pil.size
+    if w <= 0 or h <= 0:
+        raise ValueError("Bad image size")
+
+    scale = TARGET_W / float(w)
+    new_w = TARGET_W
+    new_h = int(round(h * scale))
+    img = img_pil.resize((new_w, new_h), Image.Resampling.BICUBIC)
+    t = TO_TENSOR(img)  # shape (3, new_h, new_w), values [0,1]
+
+    if new_h > TARGET_H:
+        # center-crop to 518 high
+        start = (new_h - TARGET_H) // 2
+        t = t[:, start:start + TARGET_H, :]
+    # else: keep new_h (<518), no pad yet (we batch-pad later)
+    return t  # (3, H', 518)
+
+def preprocess_batch_from_numpy(frames: List[Frame], device: torch.device) -> torch.Tensor:
+    """
+    frames: oldest -> newest
+    returns: (S, 3, H, W) float32 on 'device', [0,1] white-padded.
+    """
+    ts: List[torch.Tensor] = []
+    max_h, max_w = 0, 0
+    for fr in frames:
+        t = _resize_crop_tensor(pil_from_numpy_rgb(fr.img_rgb))  # CPU tensor
+        ts.append(t)
+        max_h = max(max_h, t.shape[1])
+        max_w = max(max_w, t.shape[2])
+
+    # ensure common shape + divisible by 14 (pad with white = 1.0)
+    target_h = ((max_h + DIVIS - 1) // DIVIS) * DIVIS
+    target_w = ((max_w + DIVIS - 1) // DIVIS) * DIVIS
+
+    padded: List[torch.Tensor] = []
+    for t in ts:
+        h_pad = target_h - t.shape[1]
+        w_pad = target_w - t.shape[2]
+        # center vertically, already exact width=518 so w_pad mostly 0 unless DIVIS forces it
+        pad_top = h_pad // 2
+        pad_bottom = h_pad - pad_top
+        pad_left = w_pad // 2
+        pad_right = w_pad - pad_left
+        if h_pad > 0 or w_pad > 0:
+            t = F.pad(t, (pad_left, pad_right, pad_top, pad_bottom), value=1.0)  # white
+        padded.append(t)
+
+    batch = torch.stack(padded, dim=0)  # (S, 3, H, W) CPU
+    return batch.to(device, non_blocking=True)
+
+
 # ----------------------- VGGT Pose Inference -----------------------
 
 def vggt_infer_poses(
@@ -126,78 +161,55 @@ def vggt_infer_poses(
     device: torch.device,
     model: VGGT,
     autocast_dtype: torch.dtype,
-    sid: str,
-    debug_save: bool,
-    debug_root: str,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], Dict[str, float]]:
     """
     Run VGGT over the provided window and return (R,t) for each frame.
-    Uses the repo's existing preprocessing/utilities. To keep things simple
-    and consistent with your Gradio pipeline, we temporarily write the window
-    images to a temp dir (or to sessions/<sid>/images when debug_save=True),
-    then call load_and_preprocess_images(image_paths).
+    Returns poses and a timing dict.
     """
-    # 1) Materialize images to disk (temp or debug)
-    if debug_save:
-        target_dir = os.path.join(debug_root, sid)
-        images_dir = os.path.join(target_dir, "images")
-        os.makedirs(images_dir, exist_ok=True)
-        # clean and rewrite the current window for clarity
-        for f in os.listdir(images_dir):
-            try:
-                os.remove(os.path.join(images_dir, f))
-            except Exception:
-                pass
-    else:
-        target_dir = tempfile.mkdtemp(prefix=f"vggt_rt_{sid}_")
-        images_dir = os.path.join(target_dir, "images")
-        os.makedirs(images_dir, exist_ok=True)
+    t0 = time.time()
+    imgs = preprocess_batch_from_numpy(frames, device)  # (S,3,H,W)
+    t1 = time.time()
 
-    image_paths: List[str] = []
-    for i, fr in enumerate(frames):
-        # Keep the original frame_id in filename for traceability
-        fn = os.path.join(images_dir, f"{fr.frame_id:06d}.png")
-        Image.fromarray(fr.img_rgb).save(fn)
-        image_paths.append(fn)
+    # Forward
+    with torch.inference_mode():
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=autocast_dtype):
+            preds = model(imgs)
+    t2 = time.time()
 
-    try:
-        # 2) Preprocess & model forward
-        t0 = time.time()
-        imgs = load_and_preprocess_images(image_paths).to(device)
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=(device.type=="cuda"), dtype=autocast_dtype):
-                predictions = model(imgs)
-        # 3) Decode poses
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], imgs.shape[-2:])
-        # Move to CPU numpy
-        extrinsic = extrinsic.detach().cpu().numpy().squeeze(0)
-        intrinsic = intrinsic.detach().cpu().numpy().squeeze(0)
+    # Decode extrinsics/intrinsics (need H,W)
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], imgs.shape[-2:])
+    extrinsic = extrinsic.detach().cpu().numpy().squeeze(0)  # (S, 4,4) or (S,3,4)
+    # intrinsic not used here, but could be returned if needed
 
-        # 4) Return camera-to-world (R,t) per frame
-        outs: List[Tuple[np.ndarray, np.ndarray]] = []
-        for i in range(extrinsic.shape[0]):
-            Ei = extrinsic[i]
-            if Ei.shape == (3,4):
-                H = np.eye(4, dtype=np.float32)
-                H[:3,:4] = Ei
-            elif Ei.shape == (4,4):
-                H = Ei.astype(np.float32)
-            else:
-                raise ValueError(f"Bad extrinsic shape: {Ei.shape}")
-            Twc = np.linalg.inv(H)  # world-from-camera
-            Rwc = Twc[:3,:3].astype(np.float32)
-            twc = Twc[:3,3].astype(np.float32)
-            outs.append((Rwc, twc))
-        return outs
-    finally:
-        # 5) Cleanup temp dir if not debugging
-        if not debug_save:
-            shutil.rmtree(target_dir, ignore_errors=True)
+    outs: List[Tuple[np.ndarray, np.ndarray]] = []
+    for i in range(extrinsic.shape[0]):
+        Ei = extrinsic[i]
+        if Ei.shape == (3, 4):
+            H = np.eye(4, dtype=np.float32)
+            H[:3, :4] = Ei
+        elif Ei.shape == (4, 4):
+            H = Ei.astype(np.float32)
+        else:
+            raise ValueError(f"Bad extrinsic shape: {Ei.shape}")
+        Twc = np.linalg.inv(H)  # world-from-camera
+        Rwc = Twc[:3, :3].astype(np.float32)
+        twc = Twc[:3, 3].astype(np.float32)
+        outs.append((Rwc, twc))
+
+    t3 = time.time()
+    timing = {
+        "preproc_ms": (t1 - t0) * 1000.0,
+        "forward_ms": (t2 - t1) * 1000.0,
+        "decode_ms": (t3 - t2) * 1000.0,
+        "total_ms":  (t3 - t0) * 1000.0,
+    }
+    return outs, timing
 
 
 # ---------------------- Server + Sliding Window --------------------
 class PoseServer:
-    def __init__(self, window_size: int = 8, cadence_ms: int = 250, debug_save: bool = False, debug_root: str = "sessions"):
+    def __init__(self, window_size: int = 3, cadence_ms: int = 2000,
+                 debug_save: bool = False, debug_root: str = "sessions"):
         self.window_size = window_size
         self.cadence_ms = cadence_ms
         self.buffers: Dict[str, Deque[Frame]] = {}
@@ -209,9 +221,15 @@ class PoseServer:
         # Lazy: one session if none provided
         self.default_session = "default"
 
-        # Load VGGT once
+        # ---- Model + CUDA opts ----
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[INFO] Using device: {self.device}")
+        if self.device.type == "cuda":
+            # Allow TF32 on Ampere+; big speedup with negligible quality hit
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        # Load VGGT once
         self.model = VGGT()
         _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
         sd = torch.hub.load_state_dict_from_url(_URL, map_location=self.device)
@@ -219,6 +237,22 @@ class PoseServer:
         self.model.eval().to(self.device)
         cc = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
         self.autocast_dtype = torch.bfloat16 if cc >= 8 else torch.float16
+
+        # ---- Warmup ----
+        self._warmup()
+
+    def _warmup(self):
+        # One dummy forward at typical size (S=2, 392x518) to JIT & pick algos
+        h = 392   # divisible by 14
+        w = 518   # divisible by 14
+        dummy = torch.zeros((2, 3, h, w), device=self.device, dtype=torch.float32)
+        t0 = time.time()
+        with torch.inference_mode():
+            with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda"),
+                                         dtype=self.autocast_dtype):
+                _ = self.model(dummy)
+        torch.cuda.synchronize() if self.device.type == "cuda" else None
+        print(f"[WARMUP] First forward took {(time.time()-t0)*1000:.1f} ms")
 
     # ------------- Session helpers -------------
     def _get_session(self, session_id: Optional[str]) -> str:
@@ -252,51 +286,40 @@ class PoseServer:
         if not self._should_run(sid, now_ms):
             return None
         if len(self.buffers[sid]) < 2:
-            # Need at least 2 frames for a stable relative pose in many methods
+            # VGGT multi-view is happier with >=2 frames
             return None
 
         self.inference_busy[sid] = True
-        t0 = time.time()
         frames = list(self.buffers[sid])  # oldest -> newest
 
-        # Call VGGT (now wired to real model)
-        poses = vggt_infer_poses(
+        poses, timing = vggt_infer_poses(
             frames=frames,
             device=self.device,
             model=self.model,
             autocast_dtype=self.autocast_dtype,
-            sid=sid,
-            debug_save=self.debug_save,
-            debug_root=self.debug_root,
         )
-        assert len(poses) == len(frames)
         R, t = poses[-1]
-
-        t1 = time.time()
         self.last_run_ms[sid] = int(now_ms)
         self.inference_busy[sid] = False
 
-        # Print a clean, human-readable block
         latest = frames[-1]
-        dt_infer = (t1 - t0) * 1000.0
         print("\n" + "-" * 64)
         print(f"[{time.strftime('%H:%M:%S')}] session={sid} frame={latest.frame_id} buffer={len(frames)}")
-        print(f"VGGT inference: {dt_infer:.1f} ms")
+        print(f"VGGT inference total: {timing['total_ms']:.1f} ms "
+              f"(preproc {timing['preproc_ms']:.1f} | forward {timing['forward_ms']:.1f} | decode {timing['decode_ms']:.1f})")
         print("pose(R|t), camera-to-world, RH coords:")
         np.set_printoptions(precision=3, suppress=True)
         print("R=\n" + str(R))
         print("t= " + str(t) + "  (m, up-to-scale unless metric anchored)")
-        # If you compute reprojection error, print here too
         print("-" * 64)
 
-        # Return a minimal JSON (handy for client debugging)
         return {
             "frame_id": latest.frame_id,
             "timestamp_ms": latest.timestamp_ms,
             "buffer": len(frames),
             "R": R.tolist(),
             "t": t.tolist(),
-            "inference_ms": dt_infer,
+            "inference_ms": timing["total_ms"],
         }
 
 
@@ -310,7 +333,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SERVER: PoseServer  # type hint alias
+SERVER: PoseServer
 _server: Optional[PoseServer] = None
 
 
@@ -318,9 +341,8 @@ _server: Optional[PoseServer] = None
 async def _on_startup():
     global _server
     if _server is None:
-        # Defaults get overridden via CLI main()
-        _server = PoseServer(window_size=8, cadence_ms=250)
-        print("[READY] Pose server initialized with window=8, cadence=250ms")
+        _server = PoseServer(window_size=3, cadence_ms=2000)
+        print("[READY] Pose server initialized with window=3, cadence=2000ms")
 
 
 @app.post("/frame")
@@ -328,12 +350,7 @@ async def post_frame(
     image: UploadFile = File(...),
     metadata: str = Form(...),
 ):
-    """Receive one frame + intrinsics, enqueue, maybe run inference.
-
-    Returns last-pose JSON if an inference just ran; otherwise returns a
-    lightweight ack. This keeps network traffic low while allowing the sender
-    to get occasional pose snapshots.
-    """
+    """Receive one frame + intrinsics, enqueue, maybe run inference."""
     assert _server is not None
 
     # Parse metadata
@@ -344,15 +361,15 @@ async def post_frame(
 
     sid = _server._get_session(session_id)
 
-    # Decode image into RGB np array
+    # Decode image into RGB np array (No disk!)
     try:
         raw = await image.read()
-        pil = Image.open(io.BytesIO(raw))
-        img_rgb = pil_to_numpy_rgb(pil)
+        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        img_rgb = np.asarray(pil)
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"bad image: {e}"})
 
-    # Build camera matrix
+    # Build camera matrix (currently unused downstream, but kept for completeness)
     K = make_K(intrinsics)
 
     # Construct frame and push to buffer
@@ -370,7 +387,6 @@ async def post_frame(
     if out is not None:
         return JSONResponse(status_code=200, content={"status": "ok", "pose": out})
     else:
-        # Ack only; no inference happened this call
         return JSONResponse(status_code=202, content={"status": "queued"})
 
 
@@ -386,15 +402,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--window", type=int, default=8)
-    parser.add_argument("--cadence-ms", type=int, default=250)
-    parser.add_argument("--debug-save", action="store_true", help="Keep per-session images under sessions/<sid>/images")
+    parser.add_argument("--window", type=int, default=3)
+    parser.add_argument("--cadence-ms", type=int, default=2000)
+    parser.add_argument("--debug-save", action="store_true",
+                        help="(kept for parity; not used in fast path)")
     parser.add_argument("--debug-root", type=str, default="sessions")
     args = parser.parse_args()
 
     global _server
-    _server = PoseServer(window_size=args.window, cadence_ms=args.cadence_ms, debug_save=args.debug_save, debug_root=args.debug_root)
-    print(f"[READY] Pose server initialized with window={args.window}, cadence={args.cadence_ms}ms, debug_save={args.debug_save}")
+    _server = PoseServer(window_size=args.window,
+                         cadence_ms=args.cadence_ms,
+                         debug_save=args.debug_save,
+                         debug_root=args.debug_root)
+    print(f"[READY] Pose server initialized with window={args.window}, "
+          f"cadence={args.cadence_ms}ms")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
